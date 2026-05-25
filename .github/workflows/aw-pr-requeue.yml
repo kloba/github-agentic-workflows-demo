@@ -1,0 +1,98 @@
+name: PR Requeue (rebase stale approved PRs)
+
+# Why this exists:
+# When a PR merges to main, any OTHER open `ready-to-merge` PR that touches the
+# same files becomes CONFLICTING/BEHIND — but nothing re-fires PR Auto-Merge for
+# it (auto-merge only listens to a PR's own label/workflow_run events, never a
+# sibling's merge). So approved PRs silently get stuck.
+#
+# This workflow runs on every push to main (i.e. after any merge) and on a cron
+# safety net. It rebases each stale approved PR onto main. The rebase push then
+# re-enters PR Auto-Merge via its `synchronize` trigger and the merge completes.
+# If a rebase hits a real conflict, the PR is routed to `needs-rework` so the
+# rework loop regenerates it on a fresh base.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-requeue
+  cancel-in-progress: false
+
+jobs:
+  requeue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Rebase stale approved PRs onto main
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # Open PRs carrying a merge label.
+          PRS=$(gh pr list --repo "$REPO" --state open --limit 100 \
+            --json number,labels,headRefName,headRepositoryOwner,baseRefName \
+            --jq '[.[] | select(.labels | map(.name) | any(. == "ready-to-merge" or . == "auto-merge"))]')
+          COUNT=$(echo "$PRS" | jq 'length')
+          echo "Open PRs with a merge label: $COUNT"
+          [ "$COUNT" = "0" ] && exit 0
+
+          git config --global user.email "actions@github.com"
+          git config --global user.name "gh-aw requeue"
+
+          echo "$PRS" | jq -c '.[]' | while read -r pr; do
+            NUM=$(echo "$pr" | jq -r .number)
+            BASE=$(echo "$pr" | jq -r .baseRefName)
+            HEAD_REF=$(echo "$pr" | jq -r .headRefName)
+            HEAD_OWNER=$(echo "$pr" | jq -r '.headRepositoryOwner.login')
+
+            if [ "$BASE" != "main" ]; then echo "#$NUM base=$BASE — skip"; continue; fi
+            if [ "$HEAD_OWNER" != "$OWNER" ]; then echo "#$NUM is from a fork — skip"; continue; fi
+
+            # Fresh mergeability. GitHub computes this asynchronously, so right
+            # after a push it reads UNKNOWN — poll until it resolves, otherwise
+            # we'd wrongly conclude "no rebase needed" and skip a conflicting PR.
+            M="UNKNOWN"; S=""
+            for k in $(seq 1 8); do
+              DATA=$(gh pr view "$NUM" --repo "$REPO" --json mergeable,mergeStateStatus)
+              M=$(echo "$DATA" | jq -r .mergeable)
+              S=$(echo "$DATA" | jq -r .mergeStateStatus)
+              [ "$M" != "UNKNOWN" ] && break
+              echo "#$NUM mergeable=UNKNOWN — waiting for GitHub to compute ($k/8)..."
+              sleep 8
+            done
+            if [ "$M" != "CONFLICTING" ] && [ "$S" != "DIRTY" ] && [ "$S" != "BEHIND" ]; then
+              echo "#$NUM is $M/$S — no rebase needed."
+              continue
+            fi
+
+            echo "::warning::#$NUM is $M/$S — rebasing onto main."
+            WORK=$(mktemp -d)
+            git clone --quiet --no-tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$WORK"
+            (
+              cd "$WORK"
+              git fetch --quiet --no-tags origin "$HEAD_REF"
+              git checkout -B "$HEAD_REF" "origin/$HEAD_REF"
+              if git rebase origin/main; then
+                git push --force-with-lease origin "HEAD:$HEAD_REF"
+                gh pr comment "$NUM" --repo "$REPO" --body "Auto-rebased onto \`main\` (a sibling change merged). Auto-merge will retry once checks pass."
+                echo "#$NUM rebased and pushed."
+              else
+                git rebase --abort || true
+                gh pr edit "$NUM" --repo "$REPO" --remove-label ready-to-merge --add-label needs-rework 2>/dev/null || true
+                gh pr comment "$NUM" --repo "$REPO" --body "Could not auto-rebase onto \`main\` (real conflict). Routed to \`needs-rework\` so the rework loop regenerates this PR on a fresh base."
+                echo "#$NUM real conflict → needs-rework."
+              fi
+            )
+          done

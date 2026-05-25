@@ -1,0 +1,114 @@
+name: Issue Fixer Retry
+
+# Re-fires Issue Fixer when a previous attempt failed with a bundle-race
+# error (the agent computed a patch against a commit that was no longer
+# reachable by the time safe-outputs tried to apply it — caused by other
+# merges landing during the agent run).
+#
+# Detection: looks at the failed run's logs for "Failed to apply bundle"
+# or "Repository lacks these prerequisite commits".
+#
+# Action: identifies the originating issue from the workflow_run payload,
+# bumps an auto-fix-retry-N counter label (max 2), then removes + re-adds
+# the trigger label to re-fire Issue Fixer with current main state.
+
+on:
+  workflow_run:
+    workflows: ["Issue Fixer"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+  issues: read
+
+concurrency:
+  group: issue-fixer-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry-on-race:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect failure cause and re-fire if race
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+          MAX_RETRIES: 5
+        run: |
+          set -euo pipefail
+
+          # 1. Find the originating issue from the workflow_run's event payload.
+          ISSUE=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '.triggering_actor.login as $a | .event' 2>/dev/null)
+          if [ "$ISSUE" != "issues" ]; then
+            echo "Not an issue-triggered run (event=$ISSUE). Nothing to retry."
+            exit 0
+          fi
+
+          # The issue number isn't directly in the run JSON; pull from the activation step's log
+          # which includes the prompt with "Issue **#<number>**" text.
+          LOG_DIR=$(mktemp -d)
+          gh run download "$RUN_ID" --repo "$REPO" --dir "$LOG_DIR" 2>/dev/null || true
+          # Fallback: fetch run logs and grep
+          ISSUE_NUM=$(gh run view "$RUN_ID" --repo "$REPO" --log 2>/dev/null \
+            | grep -oE 'Issue \*\*#[0-9]+\*\*' | head -1 | grep -oE '[0-9]+')
+
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "Could not extract issue number from run logs. Skipping retry."
+            exit 0
+          fi
+          echo "Originating issue: #$ISSUE_NUM"
+
+          # 1b. Per-issue mutex via repo label. gh label create fails (non-zero) when
+          # the label already exists, which gives us an atomic mutex without needing
+          # to know the issue number at concurrency-group evaluation time. Skip
+          # cleanly if another retry instance is already in flight for this issue.
+          LOCK_LABEL="auto-fix-retry-lock-$ISSUE_NUM"
+          if ! gh label create "$LOCK_LABEL" --repo "$REPO" --color "808080" --description "Issue Fixer retry mutex (auto-deleted)" >/dev/null 2>&1; then
+            echo "Another retry is already in flight for issue #$ISSUE_NUM. Skipping."
+            exit 0
+          fi
+          trap 'gh label delete "$LOCK_LABEL" --repo "$REPO" --yes >/dev/null 2>&1 || true' EXIT
+
+          # 2. Check if the failure was a bundle-race (not a real logic failure).
+          BUNDLE_RACE=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null \
+            | grep -cE "Failed to apply bundle|Repository lacks these prerequisite commits" || true)
+          if [ "${BUNDLE_RACE:-0}" -lt 1 ]; then
+            echo "Failure was not a bundle-race (no matching log lines). No retry."
+            exit 0
+          fi
+          echo "Confirmed bundle-race failure."
+
+          # 3. Determine current retry count from labels on the issue.
+          CURRENT_RETRY=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(startswith("auto-fix-retry-"))) | map(sub("auto-fix-retry-"; "") | tonumber) | max // 0')
+          NEXT_RETRY=$((CURRENT_RETRY + 1))
+
+          if [ "$NEXT_RETRY" -gt "$MAX_RETRIES" ]; then
+            echo "Retry limit ($MAX_RETRIES) exceeded for issue #$ISSUE_NUM. Manual intervention required."
+            gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "Issue Fixer hit a bundle-race for the $MAX_RETRIES'th time. Stopping retries. Apply the security/bug/ci-failure label manually to try again when main is stable."
+            exit 0
+          fi
+
+          # 4. Ensure the retry-counter label exists, then apply it.
+          # `|| true` on edits: label state may have been mutated by a concurrent
+          # retry that just released its mutex; a 4xx race response shouldn't fail
+          # the whole workflow.
+          gh label create "auto-fix-retry-$NEXT_RETRY" --repo "$REPO" --color "FFA500" --description "Issue Fixer retry counter" >/dev/null 2>&1 || true
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "auto-fix-retry-$NEXT_RETRY" || true
+
+          # 5. Identify which trigger label is on the issue, then bounce it to re-fire.
+          TRIGGER_LABEL=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "security" or . == "bug" or . == "ci-failure")) | first // empty')
+          if [ -z "$TRIGGER_LABEL" ]; then
+            echo "No trigger label on issue #$ISSUE_NUM. Cannot re-fire."
+            exit 0
+          fi
+
+          echo "Bouncing trigger label '$TRIGGER_LABEL' on issue #$ISSUE_NUM (retry $NEXT_RETRY/$MAX_RETRIES)"
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --remove-label "$TRIGGER_LABEL" || true
+          sleep 3
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "$TRIGGER_LABEL" || true
+          echo "Re-fire complete."

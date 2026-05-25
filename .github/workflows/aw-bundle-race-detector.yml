@@ -1,0 +1,254 @@
+name: Bundle Race Detector
+
+# Catches and recovers from gh-aw's safe-outputs/create_pull_request
+# bundle-race failures.
+#
+# When the patch the agent generated doesn't apply onto the moved main,
+# gh-aw posts a [!WARNING] comment on the source issue. Issue Fixer
+# itself still returns conclusion=success, so aw-issue-fixer-retry.yml's
+# `conclusion == failure` filter doesn't fire. This workflow watches for
+# the comment and recovers two ways:
+#
+#   1. PREFERRED — rebase: download the patch artifact from the failed
+#      run, git am --3way onto current main, push the branch, open the
+#      PR ourselves. No agent re-run, near-zero cost.
+#
+#   2. FALLBACK — label bounce: if --3way produces conflicts (real
+#      semantic drift, not just context drift), remove + re-add the
+#      trigger label so the agent re-runs against current main.
+#
+# Either path increments auto-fix-retry-N (max 5).
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write       # push the rebased branch
+  pull-requests: write  # open the recovery PR
+  issues: write         # edit labels, post status comments
+  actions: read         # download patch artifact from the failed run
+
+concurrency:
+  group: bundle-race-detector-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    # gh-aw's bundle-race notice carries a magic HTML marker
+    # (<!-- gh-aw-agentic-workflow: ... workflow_id: aw-issue-fixer ... -->)
+    # that humans don't naturally type. Combined with the "Failed to
+    # apply bundle" text, this is the safe signal — the old user-login
+    # filter was wrong (PAT-owned comments don't post as github-actions[bot]).
+    if: |
+      !github.event.issue.pull_request
+      && contains(github.event.comment.body, 'Failed to apply bundle. The code changes were not applied')
+      && contains(github.event.comment.body, 'workflow_id: aw-issue-fixer')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Acquire per-issue mutex
+        id: mutex
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          LOCK_LABEL="auto-fix-retry-lock-$ISSUE_NUM"
+          if ! gh label create "$LOCK_LABEL" --repo "$REPO" --color "808080" --description "Issue Fixer retry mutex (auto-deleted)" >/dev/null 2>&1; then
+            echo "Another retry is already in flight for issue #$ISSUE_NUM. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "lock_label=$LOCK_LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Parse comment + check retry budget
+        id: parse
+        if: steps.mutex.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          MAX_RETRIES: 5
+        run: |
+          set -euo pipefail
+
+          # Extract failed run ID from the gh-aw marker.
+          # Format: <!-- gh-aw-agentic-workflow: ..., id: NNNN, workflow_id: aw-issue-fixer, ... -->
+          RUN_ID=$(printf '%s' "$COMMENT_BODY" | grep -oE 'id: [0-9]+, workflow_id: aw-issue-fixer' | grep -oE '[0-9]+' | head -1)
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not extract Issue Fixer run ID from comment. Bailing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Failed run: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          # Verify the run is actually from aw-issue-fixer (defense vs spoofed marker).
+          RUN_PATH=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '.path' 2>/dev/null || echo "")
+          if [[ "$RUN_PATH" != *"aw-issue-fixer"* ]]; then
+            echo "Run $RUN_ID is not from aw-issue-fixer (path=$RUN_PATH). Bailing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Retry counter (shared convention with aw-issue-fixer-retry.yml).
+          CURRENT_RETRY=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(startswith("auto-fix-retry-") and (startswith("auto-fix-retry-lock-") | not))) | map(sub("auto-fix-retry-"; "") | tonumber) | max // 0')
+          NEXT_RETRY=$((CURRENT_RETRY + 1))
+          echo "next_retry=$NEXT_RETRY" >> "$GITHUB_OUTPUT"
+
+          if [ "$NEXT_RETRY" -gt "$MAX_RETRIES" ]; then
+            echo "Retry limit ($MAX_RETRIES) exceeded for #$ISSUE_NUM."
+            gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "Bundle-race retry limit ($MAX_RETRIES) hit. Stopping. Re-apply the trigger label manually once main is stable." || true
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh label create "auto-fix-retry-$NEXT_RETRY" --repo "$REPO" --color "FFA500" --description "Issue Fixer retry counter" >/dev/null 2>&1 || true
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "auto-fix-retry-$NEXT_RETRY" || true
+
+      - name: Download patch artifact from failed run
+        id: download
+        if: steps.parse.outputs.skip != 'true' && steps.parse.outputs.run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.parse.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # Download to RUNNER_TEMP — the next step is actions/checkout, which
+          # wipes anything under $GITHUB_WORKSPACE. $RUNNER_TEMP persists.
+          ART_DIR="$RUNNER_TEMP/artifact"
+          mkdir -p "$ART_DIR"
+          if ! gh run download "$RUN_ID" --repo "$REPO" --name agent --dir "$ART_DIR" 2>&1; then
+            echo "Failed to download 'agent' artifact (likely expired)."
+            echo "have_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PATCH=$(find "$ART_DIR" -maxdepth 2 -name 'aw-*.patch' | head -1)
+          OUTPUT_JSON=$(find "$ART_DIR" -maxdepth 2 -name 'agent_output.json' | head -1)
+          if [ -z "$PATCH" ] || [ -z "$OUTPUT_JSON" ]; then
+            echo "Artifact missing patch or agent_output.json (patch='$PATCH' out='$OUTPUT_JSON')."
+            echo "have_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "patch=$PATCH" >> "$GITHUB_OUTPUT"
+          echo "output_json=$OUTPUT_JSON" >> "$GITHUB_OUTPUT"
+          echo "have_artifact=true" >> "$GITHUB_OUTPUT"
+
+          # Parse PR metadata the agent intended. Write to RUNNER_TEMP for
+          # the same workspace-wipe reason; later steps reference these paths.
+          META="$RUNNER_TEMP/meta"
+          mkdir -p "$META"
+          jq -r '.items[] | select(.type=="create_pull_request") | .branch' "$OUTPUT_JSON" > "$META/branch"
+          jq -r '.items[] | select(.type=="create_pull_request") | .title' "$OUTPUT_JSON" > "$META/title"
+          jq -r '.items[] | select(.type=="create_pull_request") | .body' "$OUTPUT_JSON" > "$META/body"
+          jq -r '.items[] | select(.type=="create_pull_request") | (.base_branch // "main")' "$OUTPUT_JSON" > "$META/base"
+
+          BRANCH=$(cat "$META/branch")
+          BASE=$(cat "$META/base")
+          # Validate branch / base names — git ref characters only.
+          if ! [[ "$BRANCH" =~ ^[a-zA-Z0-9/_.-]+$ ]] || ! [[ "$BASE" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+            echo "Invalid branch/base from agent output (branch='$BRANCH' base='$BASE')."
+            echo "have_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "meta_dir=$META" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout base branch
+        if: steps.download.outputs.have_artifact == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ steps.download.outputs.base }}
+          token: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 50
+
+      - name: Attempt 3-way rebase
+        id: rebase
+        if: steps.download.outputs.have_artifact == 'true'
+        env:
+          PATCH: ${{ steps.download.outputs.patch }}
+          BRANCH: ${{ steps.download.outputs.branch }}
+          NEXT_RETRY: ${{ steps.parse.outputs.next_retry }}
+        run: |
+          set -euo pipefail
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          NEW_BRANCH="${BRANCH}-r${NEXT_RETRY}"
+          git checkout -b "$NEW_BRANCH"
+
+          # --3way lets the patch land cleanly when only context drifted;
+          # bails (non-zero) on real semantic conflicts.
+          if git am --3way "$PATCH"; then
+            echo "Rebased successfully onto current $(git rev-parse --abbrev-ref HEAD@{-1})."
+            echo "new_branch=$NEW_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "git am --3way failed — semantic conflict, falling back to label bounce."
+            git am --abort || true
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push branch + open PR
+        if: steps.rebase.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          NEW_BRANCH: ${{ steps.rebase.outputs.new_branch }}
+          BASE: ${{ steps.download.outputs.base }}
+          META_DIR: ${{ steps.download.outputs.meta_dir }}
+          RUN_ID: ${{ steps.parse.outputs.run_id }}
+          NEXT_RETRY: ${{ steps.parse.outputs.next_retry }}
+        run: |
+          set -euo pipefail
+          git push origin "$NEW_BRANCH"
+
+          # Match gh-aw create-pull-request safe-output labels.
+          gh pr create \
+            --repo "$REPO" \
+            --base "$BASE" \
+            --head "$NEW_BRANCH" \
+            --title "$(cat "$META_DIR/title")" \
+            --body-file "$META_DIR/body" \
+            --label automated-fix \
+            --label awaiting-review
+
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label auto-fix-attempted || true
+
+          gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "Bundle race recovered without re-running the agent: rebased patch from run $RUN_ID onto current \`$BASE\` via \`git am --3way\` (retry $NEXT_RETRY/5)."
+
+      - name: Fallback — bounce trigger label to re-fire agent
+        if: |
+          steps.parse.outputs.skip != 'true'
+          && (steps.download.outputs.have_artifact != 'true' || steps.rebase.outputs.ok == 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          NEXT_RETRY: ${{ steps.parse.outputs.next_retry }}
+        run: |
+          set -euo pipefail
+          TRIGGER_LABEL=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "security" or . == "bug" or . == "ci-failure")) | first // empty')
+          if [ -z "$TRIGGER_LABEL" ]; then
+            echo "No trigger label on issue #$ISSUE_NUM. Cannot re-fire."
+            exit 0
+          fi
+          echo "Rebase unavailable. Bouncing '$TRIGGER_LABEL' on #$ISSUE_NUM (retry $NEXT_RETRY/5)"
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --remove-label "$TRIGGER_LABEL" || true
+          sleep 3
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "$TRIGGER_LABEL" || true
+
+      - name: Release mutex
+        if: always() && steps.mutex.outputs.lock_label != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          LOCK_LABEL: ${{ steps.mutex.outputs.lock_label }}
+        run: gh label delete "$LOCK_LABEL" --repo "$REPO" --yes >/dev/null 2>&1 || true

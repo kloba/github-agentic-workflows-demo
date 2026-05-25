@@ -1,0 +1,113 @@
+name: Code Scanning Alert Detector
+
+# Hourly poll of /repos/.../code-scanning/alerts. Covers CodeQL findings,
+# malware detection alerts, and AI-categorized findings (the same API
+# returns all of them, distinguished by tool.name and rule).
+#
+# Routes findings into the Issue Fixer pipeline (security label) with
+# `auto-fix-eligible`. Malware findings get `do-not-fix` since they need
+# investigation, not a defensive guard.
+#
+# See: https://github.com/OWNER/REPO/security/quality
+
+on:
+  schedule:
+    - cron: "25 * * * *"  # hourly at :25
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  security-events: read
+
+concurrency:
+  group: codescan-detector
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch open code scanning alerts and file issues
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if ! ALERTS=$(gh api "repos/$REPO/code-scanning/alerts?state=open&ref=refs/heads/main&per_page=50" 2>/dev/null); then
+            echo "::warning::Could not fetch code scanning alerts (token may lack security_events scope, or code scanning is not enabled). Skipping run."
+            exit 0
+          fi
+
+          if ! echo "$ALERTS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::warning::Code scanning API returned non-array. Skipping."
+            echo "$ALERTS" | head -c 500
+            exit 0
+          fi
+
+          COUNT=$(echo "$ALERTS" | jq 'length')
+          echo "Found $COUNT open code scanning alerts"
+
+          echo "$ALERTS" | jq -c '.[]' | while read -r alert; do
+            ALERT_NUM=$(echo "$alert" | jq -r '.number')
+            TOOL=$(echo "$alert" | jq -r '.tool.name')
+            RULE_ID=$(echo "$alert" | jq -r '.rule.id')
+            RULE_DESC=$(echo "$alert" | jq -r '.rule.description')
+            SEVERITY=$(echo "$alert" | jq -r '.rule.severity')
+            SEC_SEVERITY=$(echo "$alert" | jq -r '.rule.security_severity_level // "n/a"')
+            FILE_PATH=$(echo "$alert" | jq -r '.most_recent_instance.location.path')
+            START_LINE=$(echo "$alert" | jq -r '.most_recent_instance.location.start_line')
+            MESSAGE=$(echo "$alert" | jq -r '.most_recent_instance.message.text')
+            ALERT_URL=$(echo "$alert" | jq -r '.html_url')
+
+            MARKER="<!-- codescan-alert:${ALERT_NUM} -->"
+
+            EXISTING=$(gh issue list --repo "$REPO" --state open --label "code-scanning" --json number,body -q ".[] | select(.body | contains(\"$MARKER\")) | .number" | head -1)
+
+            if [ -n "$EXISTING" ]; then
+              echo "Skipping alert $ALERT_NUM — already tracked in #$EXISTING"
+              continue
+            fi
+
+            # Malware alerts get do-not-fix; everything else is auto-fix-eligible.
+            AUTO_FIX_LABEL="auto-fix-eligible"
+            EXTRA_LABEL="code-scanning"
+            TOOL_LOWER=$(echo "$TOOL" | tr '[:upper:]' '[:lower:]')
+            if [[ "$TOOL_LOWER" == *malware* ]] || [[ "$RULE_ID" == *malware* ]]; then
+              AUTO_FIX_LABEL="do-not-fix"
+              EXTRA_LABEL="malware"
+            fi
+
+            TITLE="[codescan] ${SEVERITY} ${RULE_ID} in ${FILE_PATH}:${START_LINE}"
+
+            BODY=$(cat <<EOF
+          ## Code scanning alert #${ALERT_NUM}
+
+          - **Tool**: ${TOOL}
+          - **Rule**: \`${RULE_ID}\` — ${RULE_DESC}
+          - **Severity**: ${SEVERITY} (security-severity: ${SEC_SEVERITY})
+          - **Location**: \`${FILE_PATH}:${START_LINE}\`
+
+          ### Message
+
+          > ${MESSAGE}
+
+          [View alert →](${ALERT_URL})
+
+          ## Action
+
+          $([ "$AUTO_FIX_LABEL" = "auto-fix-eligible" ] && echo "The Issue Fixer will pick this up and propose a defensive code change. Backend Tests must pass before merge." || echo "**Manual investigation required.** Malware findings need a human to inspect — the Issue Fixer is excluded.")
+
+          ${MARKER}
+          EOF
+          )
+
+            echo "Filing new issue for alert $ALERT_NUM (tool=${TOOL}, rule=${RULE_ID})"
+            gh issue create \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "security,${EXTRA_LABEL},${AUTO_FIX_LABEL}" || echo "::warning::Failed to file issue for alert $ALERT_NUM"
+          done

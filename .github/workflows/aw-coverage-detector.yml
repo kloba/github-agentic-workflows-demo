@@ -1,0 +1,111 @@
+name: Coverage Detector
+
+# Fires after the Test Status Badge workflow updates coverage on main.
+# Reads the freshly-committed coverage badge, files an issue if coverage
+# dropped below the threshold. Dedup: if an open `[coverage]` issue
+# already exists, post a comment instead of opening a new one.
+#
+# Threshold: 65%. Current main sits at ~69%; the autonomous Issue Fixer
+# loop has repeatedly added pure-unit tests but the codebase is large
+# and untested code dwarfs each batch. 65% is the floor below which
+# something has genuinely regressed and the loop should be re-fired;
+# above 65% the loop can keep improving coverage organically without
+# every push creating a new ticket. Raise this back toward 80 over time
+# as test coverage catches up.
+#
+# Designed to feed the Issue Triager → Issue Fixer pipeline: the issue
+# carries `bug` + `coverage` labels so the Issue Fixer picks it up and
+# proposes test additions.
+
+on:
+  workflow_run:
+    workflows: ["Test Status Badge"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  THRESHOLD: 65
+
+concurrency:
+  group: coverage-detector
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Extract coverage from badge
+        id: cov
+        run: |
+          set -euo pipefail
+          BADGE=.github/badges/coverage.svg
+          if [ ! -f "$BADGE" ]; then
+            echo "::error::coverage badge not found at $BADGE"
+            exit 1
+          fi
+          # shields.io SVG embeds the percentage as text like ">78.3%<"
+          COV=$(grep -oE '>[0-9]+\.[0-9]+%<' "$BADGE" | head -1 | tr -d '<>%')
+          if [ -z "$COV" ]; then
+            echo "::error::Could not parse coverage from $BADGE"
+            exit 1
+          fi
+          COV_INT=${COV%.*}
+          echo "coverage=$COV" >> "$GITHUB_OUTPUT"
+          echo "coverage_int=$COV_INT" >> "$GITHUB_OUTPUT"
+          echo "Current coverage: ${COV}% (threshold ${THRESHOLD}%)"
+
+      - name: File or update issue if below threshold
+        if: ${{ steps.cov.outputs.coverage_int < env.THRESHOLD }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          COV: ${{ steps.cov.outputs.coverage }}
+          THRESHOLD: ${{ env.THRESHOLD }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TITLE_PREFIX="[coverage] Backend coverage below threshold"
+          BODY=$(cat <<EOF
+          Backend test coverage on \`main\` is **${COV}%**, below the ${THRESHOLD}% threshold.
+
+          ## Action
+
+          Add tests under \`billing-dashboard/backend/tests/\` to lift coverage. The Issue Fixer agent will pick this up if labeled \`bug\` (already applied).
+
+          ## How this was detected
+
+          Workflow: \`aw-coverage-detector.yml\` — triggered after \`ci-test-status-badge.yml\` finished on main.
+          Source of truth: \`.github/badges/coverage.svg\`.
+
+          *This issue is auto-filed. To opt out of automated fixing, apply the \`do-not-fix\` label.*
+          EOF
+          )
+
+          EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title $TITLE_PREFIX" --json number,title -q ".[] | select(.title | startswith(\"$TITLE_PREFIX\")) | .number" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Existing open issue #$EXISTING — posting comment"
+            gh issue comment "$EXISTING" --repo "$REPO" --body "Coverage check ran again: still **${COV}%** (threshold ${THRESHOLD}%)."
+          else
+            echo "Filing new coverage issue"
+            gh issue create \
+              --repo "$REPO" \
+              --title "$TITLE_PREFIX (${COV}%)" \
+              --body "$BODY" \
+              --label "bug,coverage,auto-fix-eligible"
+          fi
+
+      - name: Coverage OK
+        if: ${{ steps.cov.outputs.coverage_int >= env.THRESHOLD }}
+        run: |
+          echo "Coverage ${{ steps.cov.outputs.coverage }}% meets ${THRESHOLD}% threshold — no issue filed."

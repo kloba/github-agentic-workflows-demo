@@ -1,0 +1,185 @@
+name: Azure Log Analytics Error Detector
+
+# Hourly: query Azure Log Analytics (Application Insights) for ERROR-level
+# entries, group by exception signature (class + originating file/function),
+# file a GitHub issue per NEW signature crossing the threshold. Dedup via
+# signature hash embedded in the issue body — same signature within the same
+# week posts a comment instead of opening a duplicate.
+#
+# Routes signatures to the Issue Fixer pipeline: each filed issue is
+# labeled `bug` + `log-analytics-error` + `auto-fix-eligible`, which the
+# Triager confirms and the Issue Fixer picks up to propose a defensive
+# code change.
+#
+# Auth: OIDC federation against an Entra ID app registration with
+# `Log Analytics Reader` on the workspace.
+
+on:
+  schedule:
+    - cron: "15 * * * *"
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: "How many hours back to query"
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+env:
+  # Set these via repo variables/secrets to point at your workspace.
+  AZURE_LOG_ANALYTICS_WORKSPACE_ID: ${{ vars.AZURE_LOG_ANALYTICS_WORKSPACE_ID }}
+  AZURE_APP_INSIGHTS_TABLE: AppExceptions     # or `AppTraces` / `ContainerAppConsoleLogs_CL`
+  MIN_OCCURRENCES: 5
+  MAX_NEW_ISSUES_PER_RUN: 3
+
+concurrency:
+  group: error-detector
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Azure login (OIDC, federated)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Query Log Analytics for grouped error signatures
+        id: query
+        env:
+          HOURS_BACK: ${{ github.event.inputs.hours_back || '1' }}
+        run: |
+          set -euo pipefail
+
+          # Kusto/KQL: extract exception class from message, group + count.
+          # Application Insights `AppExceptions` exposes the type as
+          # `ExceptionType`. For raw log tables (e.g. `ContainerAppConsoleLogs_CL`)
+          # the regex `extract` branch picks up "FooError"/"BarException" tokens.
+          KUSTO=$(cat <<EOF
+          ${AZURE_APP_INSIGHTS_TABLE}
+          | where TimeGenerated > ago(${HOURS_BACK}h)
+          | extend exc_class = coalesce(
+                column_ifexists("ExceptionType", ""),
+                extract(@"([A-Z][A-Za-z]*(?:Error|Exception))(?::|\b)", 1, tostring(Message))
+            )
+          | where isnotempty(exc_class)
+          | summarize cnt = count() by exc_class
+          | top 10 by cnt desc
+          EOF
+          )
+
+          RESULT=$(az monitor log-analytics query \
+            --workspace "$AZURE_LOG_ANALYTICS_WORKSPACE_ID" \
+            --analytics-query "$KUSTO" \
+            -o json)
+
+          # `az monitor log-analytics query` returns a flat array of rows:
+          # [{"exc_class": "...", "cnt": N}, ...]
+          echo "$RESULT" > /tmp/signatures.json
+
+          echo "Signatures found:"
+          jq -r '.[] | "\(.cnt) \(.exc_class)"' /tmp/signatures.json || true
+
+          echo "result_file=/tmp/signatures.json" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch a representative log line per signature
+        id: samples
+        env:
+          HOURS_BACK: ${{ github.event.inputs.hours_back || '1' }}
+        run: |
+          set -euo pipefail
+          echo "{}" > /tmp/samples.json
+
+          jq -r '.[] | [.exc_class, (.cnt | tonumber)] | @tsv' /tmp/signatures.json | \
+          while IFS=$'\t' read -r EXC CNT; do
+            [ "$CNT" -lt "$MIN_OCCURRENCES" ] && continue
+
+            SAMPLE_KQL=$(cat <<EOF
+          ${AZURE_APP_INSIGHTS_TABLE}
+          | where TimeGenerated > ago(${HOURS_BACK}h)
+          | where tostring(Message) has "${EXC}" or column_ifexists("ExceptionType", "") == "${EXC}"
+          | project Message
+          | take 1
+          EOF
+          )
+            EVENT=$(az monitor log-analytics query \
+              --workspace "$AZURE_LOG_ANALYTICS_WORKSPACE_ID" \
+              --analytics-query "$SAMPLE_KQL" \
+              -o tsv 2>/dev/null || echo "")
+
+            EVENT_TRUNC=$(echo "$EVENT" | head -c 800)
+            jq --arg k "$EXC" --arg v "$EVENT_TRUNC" '. + {($k): $v}' /tmp/samples.json > /tmp/samples.tmp
+            mv /tmp/samples.tmp /tmp/samples.json
+          done
+
+          cat /tmp/samples.json
+
+      - name: File issues for new signatures
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          FILED=0
+
+          jq -r '.[] | [.exc_class, (.cnt | tonumber)] | @tsv' /tmp/signatures.json | \
+          while IFS=$'\t' read -r EXC CNT; do
+            if [ "$CNT" -lt "$MIN_OCCURRENCES" ]; then
+              echo "Skipping $EXC ($CNT occurrences < $MIN_OCCURRENCES)"
+              continue
+            fi
+            if [ "$FILED" -ge "$MAX_NEW_ISSUES_PER_RUN" ]; then
+              echo "Hit max new issues per run ($MAX_NEW_ISSUES_PER_RUN); stopping"
+              break
+            fi
+
+            SIG=$(printf "%s" "$EXC" | sha256sum | cut -c1-12)
+            MARKER="<!-- sig:${SIG} -->"
+
+            EXISTING=$(gh issue list --repo "$REPO" --state open --label "log-analytics-error" --json number,body -q ".[] | select(.body | contains(\"$MARKER\")) | .number" | head -1)
+
+            SAMPLE=$(jq -r --arg k "$EXC" '.[$k] // "(no sample message captured)"' /tmp/samples.json)
+
+            if [ -n "$EXISTING" ]; then
+              echo "Existing issue #$EXISTING for $EXC — posting comment"
+              gh issue comment "$EXISTING" --repo "$REPO" --body "Still firing: **${CNT}** occurrences in the last hour."
+            else
+              echo "Filing new issue for $EXC ($CNT occurrences)"
+              BODY=$(cat <<EOF
+          ## Error signature: \`${EXC}\`
+
+          Occurred **${CNT}** times in the last hour in Azure Log Analytics workspace \`${AZURE_LOG_ANALYTICS_WORKSPACE_ID}\` (table \`${AZURE_APP_INSIGHTS_TABLE}\`).
+
+          ### Sample log line
+
+          \`\`\`
+          ${SAMPLE}
+          \`\`\`
+
+          ### Action
+
+          The Issue Fixer agent will pick this up (label \`bug\` applied). It will look for the originating router/dependency and propose a defensive guard (try/except, input validation, None-check).
+
+          To opt out of automated fixing, apply the \`do-not-fix\` label.
+
+          ${MARKER}
+          EOF
+          )
+              gh issue create \
+                --repo "$REPO" \
+                --title "[error] ${EXC} firing ${CNT}x/h in backend" \
+                --body "$BODY" \
+                --label "bug,log-analytics-error,auto-fix-eligible"
+              FILED=$((FILED + 1))
+            fi
+          done
+
+          echo "Filed $FILED new issues this run."

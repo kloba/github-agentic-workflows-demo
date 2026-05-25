@@ -1,0 +1,117 @@
+name: PR Rework on Reviewer Reject
+
+# Fires when PR Reviewer (or a human) applies `needs-rework` to a PR.
+# Closes the PR, reopens the linked issue (if it was auto-closed by the
+# `Closes #N` reference), and re-fires Issue Fixer by removing the
+# `auto-fix-attempted` dedup label and re-applying the original trigger
+# label (bug / security / ci-failure).
+#
+# Retry cap: 3 attempts. After that, applies `do-not-fix` and pages a
+# human via a comment.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-rework-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  MAX_RETRIES: 3
+
+jobs:
+  rework:
+    if: |
+      github.event.label.name == 'needs-rework' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close PR, reopen issue, re-fire Issue Fixer
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          # Extract the linked issue from the PR body (`Closes #N` / `Fixes #N`)
+          ISSUE_NUM=$(echo "$PR_BODY" | grep -ioE '(closes|fixes|resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || echo "")
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "::warning::Could not find linked issue in PR #$PR_NUM body. Closing PR only."
+            gh pr close "$PR_NUM" --repo "$REPO" --comment "Closed by aw-pr-rework: PR Reviewer applied \`needs-rework\` but no linked issue was found in the PR body. Manual follow-up needed." || true
+            exit 0
+          fi
+
+          echo "Linked issue: #$ISSUE_NUM"
+
+          # Count prior retries by looking for auto-fix-retry-N labels on the issue
+          ISSUE_LABELS=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels --jq '.labels[].name')
+          CURRENT_RETRY=$(echo "$ISSUE_LABELS" | grep -oE '^auto-fix-retry-[0-9]+$' | grep -oE '[0-9]+$' | sort -rn | head -1 || echo "0")
+          CURRENT_RETRY=${CURRENT_RETRY:-0}
+          NEXT_RETRY=$((CURRENT_RETRY + 1))
+
+          # Identify the original trigger label
+          TRIGGER_LABEL=""
+          for L in bug security ci-failure feature-request chore; do
+            if echo "$ISSUE_LABELS" | grep -qx "$L"; then
+              TRIGGER_LABEL="$L"
+              break
+            fi
+          done
+
+          if [ "$NEXT_RETRY" -gt "$MAX_RETRIES" ]; then
+            echo "Retry cap reached ($MAX_RETRIES). Applying do-not-fix."
+            gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "do-not-fix" || true
+            gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "## 🛑 Auto-fix retry cap hit ($MAX_RETRIES attempts)
+
+          PR Reviewer rejected all attempted fixes. Applying \`do-not-fix\` — human attention needed.
+
+          Latest rejected PR: #$PR_NUM"
+            gh pr close "$PR_NUM" --repo "$REPO" --comment "Closed by aw-pr-rework: retry cap hit on issue #$ISSUE_NUM." || true
+            exit 0
+          fi
+
+          # Capture the review verdict for context (last comment authored by gh-aw)
+          REVIEW_BODY=$(gh pr view "$PR_NUM" --repo "$REPO" --json comments --jq '[.comments[] | select(.author.login == "github-actions[bot]" or (.body | startswith("##") and contains("review")))] | last | .body' 2>/dev/null || echo "")
+
+          # Close the PR with a reference to the rework path
+          gh pr close "$PR_NUM" --repo "$REPO" --comment "## ↩️ Reverted to Issue Fixer
+
+          PR Reviewer applied \`needs-rework\`. Closing this PR — Issue #$ISSUE_NUM will be re-tried.
+
+          Retry: **$NEXT_RETRY / $MAX_RETRIES**"
+
+          # Comment on the issue with review feedback for context
+          gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "## ↩️ Reverting to Issue Fixer (retry $NEXT_RETRY / $MAX_RETRIES)
+
+          PR #$PR_NUM was rejected by PR Reviewer with \`needs-rework\`. Closed it and re-firing Issue Fixer.
+
+          Latest review feedback excerpt (if any) — see PR for full context:
+          > ${REVIEW_BODY:0:500}"
+
+          # Reset state on the issue:
+          # 1. Remove auto-fix-attempted (so Issue Fixer can re-fire)
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --remove-label "auto-fix-attempted" 2>&1 || true
+          # 2. Add the retry-N label
+          gh label create "auto-fix-retry-$NEXT_RETRY" --color "fbca04" --description "Auto-fix attempt $NEXT_RETRY of $MAX_RETRIES" --force 2>&1 | tail -1 || true
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "auto-fix-retry-$NEXT_RETRY" 2>&1 || true
+          # 3. Reopen the issue if it was auto-closed by the merge
+          gh issue reopen "$ISSUE_NUM" --repo "$REPO" 2>&1 || true
+          # 4. Re-fire by removing-and-readding the trigger label
+          if [ -n "$TRIGGER_LABEL" ]; then
+            gh issue edit "$ISSUE_NUM" --repo "$REPO" --remove-label "$TRIGGER_LABEL" 2>&1 || true
+            sleep 2
+            gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "$TRIGGER_LABEL" 2>&1 || true
+            echo "Re-fired Issue Fixer on #$ISSUE_NUM via $TRIGGER_LABEL label cycle"
+          else
+            echo "::warning::No bug/security/ci-failure/feature-request/chore label found on issue — cannot re-fire Issue Fixer automatically"
+          fi

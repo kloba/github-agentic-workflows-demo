@@ -1,0 +1,113 @@
+name: Dependabot Alert Detector
+
+# Hourly poll of /repos/.../dependabot/alerts. Files a GitHub issue per
+# new open alert so it shows up in the Issue Triager → Issue Fixer
+# pipeline.
+#
+# Why polling: GitHub Actions doesn't expose `dependabot_alert` as a
+# workflow trigger — it's a webhook event only. We poll instead.
+#
+# Why do-not-fix: the Issue Fixer cannot patch pinned dependencies (it
+# doesn't touch requirements.txt / package.json). Resolution path is
+# Dependabot's own version-update PR via .github/dependabot.yml — those
+# PRs auto-merge if labeled.
+#
+# See: https://github.com/OWNER/REPO/security/dependabot
+
+on:
+  schedule:
+    - cron: "20 * * * *"  # hourly at :20
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: dependabot-detector
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch open Dependabot alerts and file issues
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Pull open alerts. The Dependabot alerts API requires the PAT
+          # to have `security_events` scope; the default GITHUB_TOKEN
+          # generally lacks this. If the call fails with 403, the workflow
+          # exits cleanly and waits for the next hour.
+          if ! ALERTS=$(gh api "repos/$REPO/dependabot/alerts?state=open&per_page=50" 2>/dev/null); then
+            echo "::warning::Could not fetch Dependabot alerts (token may lack security_events scope). Skipping run."
+            exit 0
+          fi
+
+          # If GitHub returns an error object (no array), bail gracefully.
+          if ! echo "$ALERTS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::warning::Dependabot API returned non-array. Skipping."
+            echo "$ALERTS" | head -c 500
+            exit 0
+          fi
+
+          COUNT=$(echo "$ALERTS" | jq 'length')
+          echo "Found $COUNT open Dependabot alerts"
+
+          echo "$ALERTS" | jq -c '.[]' | while read -r alert; do
+            ALERT_NUM=$(echo "$alert" | jq -r '.number')
+            PKG=$(echo "$alert" | jq -r '.dependency.package.name')
+            ECOSYSTEM=$(echo "$alert" | jq -r '.dependency.package.ecosystem')
+            MANIFEST=$(echo "$alert" | jq -r '.dependency.manifest_path')
+            SEVERITY=$(echo "$alert" | jq -r '.security_vulnerability.severity')
+            GHSA=$(echo "$alert" | jq -r '.security_advisory.ghsa_id')
+            SUMMARY=$(echo "$alert" | jq -r '.security_advisory.summary')
+            ALERT_URL=$(echo "$alert" | jq -r '.html_url')
+            PATCHED=$(echo "$alert" | jq -r '.security_vulnerability.first_patched_version.identifier // "unknown"')
+            VULN_RANGE=$(echo "$alert" | jq -r '.security_vulnerability.vulnerable_version_range')
+
+            MARKER="<!-- dependabot-alert:${ALERT_NUM} -->"
+            TITLE="[dependabot] ${SEVERITY} ${PKG} (${ECOSYSTEM}): ${GHSA}"
+
+            EXISTING=$(gh issue list --repo "$REPO" --state open --label "dependabot" --json number,body -q ".[] | select(.body | contains(\"$MARKER\")) | .number" | head -1)
+
+            if [ -n "$EXISTING" ]; then
+              echo "Skipping alert $ALERT_NUM — already tracked in issue #$EXISTING"
+              continue
+            fi
+
+            BODY=$(cat <<EOF
+          ## Dependabot alert #${ALERT_NUM}
+
+          - **Package**: \`${PKG}\` (${ECOSYSTEM})
+          - **Manifest**: \`${MANIFEST}\`
+          - **Severity**: ${SEVERITY}
+          - **Advisory**: [${GHSA}](https://github.com/advisories/${GHSA})
+          - **Vulnerable range**: \`${VULN_RANGE}\`
+          - **First patched version**: \`${PATCHED}\`
+
+          > ${SUMMARY}
+
+          ## Resolution path
+
+          Dependabot will open a PR to bump \`${PKG}\` if \`.github/dependabot.yml\` covers the \`${ECOSYSTEM}\` ecosystem. The universal \`aw-pr-auto-merge.yml\` workflow merges any PR labeled \`auto-merge\` once Backend Tests passes.
+
+          For major-version bumps, review the PR manually before applying \`auto-merge\` — breaking changes shouldn't auto-deploy.
+
+          [View alert →](${ALERT_URL})
+
+          ${MARKER}
+          EOF
+          )
+
+            echo "Filing new issue for alert $ALERT_NUM (${PKG} ${SEVERITY})"
+            gh issue create \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "security,dependabot,do-not-fix" || echo "::warning::Failed to file issue for alert $ALERT_NUM"
+          done

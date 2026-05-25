@@ -1,0 +1,142 @@
+name: PR Rework on Test Failure
+
+# Fires when Backend Tests fails on a PR that's already in the autonomous
+# pipeline (has `automated-fix`, `awaiting-review`, or `ready-to-merge`).
+# Closes the PR and kicks Issue Fixer back into action with the next
+# retry slot — the same rework outcome as `aw-pr-rework.yml`, but
+# triggered by failing CI instead of a reviewer rejection.
+#
+# Human-authored PRs are NOT affected — only PRs that originated from
+# the agentic pipeline. Humans fix their own test failures.
+#
+# Retry cap: 3 attempts (shared counter with `aw-pr-rework.yml` via the
+# `auto-fix-retry-N` label progression on the issue).
+
+on:
+  workflow_run:
+    workflows: ["Backend Tests"]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  MAX_RETRIES: 3
+
+jobs:
+  rework:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Find the PR, check eligibility, close + re-fire Issue Fixer
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          # Find the PR for this head SHA.
+          PR_NUM=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ]; then
+            echo "No PR found for head $HEAD_SHA — skipping (push event or non-PR run)."
+            exit 0
+          fi
+          echo "Failed Backend Tests run is associated with PR #$PR_NUM"
+
+          # Check PR labels — only act on pipeline-originated PRs.
+          PR_DATA=$(gh pr view "$PR_NUM" --repo "$REPO" --json labels,body,state,author)
+          PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
+          PR_LABELS=$(echo "$PR_DATA" | jq -r '.labels[].name')
+          PR_BODY=$(echo "$PR_DATA" | jq -r '.body')
+          PR_AUTHOR=$(echo "$PR_DATA" | jq -r '.author.login')
+
+          if [ "$PR_STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUM is not open (state=$PR_STATE) — skipping."
+            exit 0
+          fi
+
+          IS_PIPELINE=0
+          for L in automated-fix awaiting-review ready-to-merge; do
+            if echo "$PR_LABELS" | grep -qx "$L"; then
+              IS_PIPELINE=1
+              break
+            fi
+          done
+
+          if [ "$IS_PIPELINE" -ne 1 ]; then
+            echo "PR #$PR_NUM lacks pipeline labels — human-authored, skipping rework."
+            exit 0
+          fi
+
+          # Extract linked issue.
+          ISSUE_NUM=$(echo "$PR_BODY" | grep -ioE '(closes|fixes|resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || echo "")
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "::warning::Could not find linked issue in PR #$PR_NUM body. Closing PR only."
+            gh pr close "$PR_NUM" --repo "$REPO" --comment "Closed by aw-pr-test-fail-rework: Backend Tests failed and no linked issue was found. Manual follow-up needed.
+
+          Failed run: $RUN_URL" || true
+            exit 0
+          fi
+
+          echo "Linked issue: #$ISSUE_NUM"
+
+          # Count prior retries.
+          ISSUE_LABELS=$(gh issue view "$ISSUE_NUM" --repo "$REPO" --json labels --jq '.labels[].name')
+          CURRENT_RETRY=$(echo "$ISSUE_LABELS" | grep -oE '^auto-fix-retry-[0-9]+$' | grep -oE '[0-9]+$' | sort -rn | head -1 || echo "0")
+          CURRENT_RETRY=${CURRENT_RETRY:-0}
+          NEXT_RETRY=$((CURRENT_RETRY + 1))
+
+          TRIGGER_LABEL=""
+          for L in bug security ci-failure feature-request; do
+            if echo "$ISSUE_LABELS" | grep -qx "$L"; then
+              TRIGGER_LABEL="$L"
+              break
+            fi
+          done
+
+          if [ "$NEXT_RETRY" -gt "$MAX_RETRIES" ]; then
+            echo "Retry cap reached. Applying do-not-fix."
+            gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "do-not-fix" || true
+            gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "## 🛑 Auto-fix retry cap hit ($MAX_RETRIES attempts)
+
+          Backend Tests kept failing across $MAX_RETRIES attempts. Applying \`do-not-fix\` — human attention needed.
+
+          Latest failed CI run: $RUN_URL
+          Latest closed PR: #$PR_NUM"
+            gh pr close "$PR_NUM" --repo "$REPO" --comment "Closed: Backend Tests failed and retry cap hit on issue #$ISSUE_NUM." || true
+            exit 0
+          fi
+
+          # Get a brief test failure excerpt for the issue comment.
+          gh pr close "$PR_NUM" --repo "$REPO" --comment "## ↩️ Reverted by failed Backend Tests
+
+          Backend Tests failed on this PR. Closing — Issue #$ISSUE_NUM will be re-tried.
+
+          Retry: **$NEXT_RETRY / $MAX_RETRIES**
+          Failed CI run: $RUN_URL"
+
+          gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "## ↩️ Backend Tests failed — re-firing Issue Fixer (retry $NEXT_RETRY / $MAX_RETRIES)
+
+          PR #$PR_NUM closed because pytest didn't pass. Re-firing Issue Fixer with the next retry.
+
+          Failed CI run: $RUN_URL"
+
+          # Reset state on the issue and re-fire.
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --remove-label "auto-fix-attempted" 2>&1 || true
+          gh label create "auto-fix-retry-$NEXT_RETRY" --color "fbca04" --description "Auto-fix attempt $NEXT_RETRY of $MAX_RETRIES" --force 2>&1 | tail -1 || true
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "auto-fix-retry-$NEXT_RETRY" 2>&1 || true
+          gh issue reopen "$ISSUE_NUM" --repo "$REPO" 2>&1 || true
+
+          if [ -n "$TRIGGER_LABEL" ]; then
+            gh issue edit "$ISSUE_NUM" --repo "$REPO" --remove-label "$TRIGGER_LABEL" 2>&1 || true
+            sleep 2
+            gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "$TRIGGER_LABEL" 2>&1 || true
+            echo "Re-fired Issue Fixer on #$ISSUE_NUM via $TRIGGER_LABEL"
+          else
+            echo "::warning::No trigger label found on issue — cannot re-fire Issue Fixer automatically"
+          fi

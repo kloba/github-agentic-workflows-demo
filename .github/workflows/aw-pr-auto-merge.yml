@@ -1,0 +1,227 @@
+name: PR Auto-Merge
+
+# Universal auto-merger: any PR labeled `auto-merge` or `ready-to-merge`
+# gets merged once Backend Tests passes. No human click required.
+#
+# Why we don't use GitHub's --auto feature: GitHub blocks
+# `enablePullRequestAutoMerge` unless the branch has protection with a
+# required status check or required review. Setting up branch protection
+# adds friction (admin-bypass surface, badge-commit edge cases, etc.).
+# Instead, this workflow polls Backend Tests directly and calls
+# `gh pr merge --squash` once the check is green — equivalent outcome,
+# no repo-level setting changes required.
+#
+# Two triggers cover the timing edge cases:
+#   1. pull_request labeled — fires immediately when the label lands.
+#      If tests already passed, we merge right away. If they're still
+#      running, we briefly wait inside the job.
+#   2. workflow_run after Backend Tests — fires when tests finish, so
+#      labels applied BEFORE tests passed still get merged when tests
+#      go green.
+
+on:
+  pull_request:
+    types: [opened, labeled, reopened, ready_for_review, synchronize]
+  workflow_run:
+    workflows: ["Backend Tests"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# cancel-in-progress: collapse the many events a single PR emits (opened,
+# labeled, synchronize, workflow_run, ...) to the latest run, instead of
+# queueing a separate API-heavy merge job for each. Cuts REST consumption,
+# which is the factory's scarce shared resource.
+concurrency:
+  group: pr-auto-merge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve PR number and label state
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            # workflow_run trigger — find PR(s) for the head SHA
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            PR_NUM=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" --jq '.[0].number' 2>/dev/null || echo "")
+            if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ]; then
+              echo "No PR for head $HEAD_SHA (likely push to main, not a PR run)."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "pr=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+          # Fetch PR state + labels.
+          PR_DATA=$(gh pr view "$PR_NUM" --repo "$REPO" --json state,labels,isDraft,baseRefName,headRepositoryOwner)
+          STATE=$(echo "$PR_DATA" | jq -r .state)
+          IS_DRAFT=$(echo "$PR_DATA" | jq -r .isDraft)
+          BASE=$(echo "$PR_DATA" | jq -r .baseRefName)
+          HEAD_OWNER=$(echo "$PR_DATA" | jq -r '.headRepositoryOwner.login')
+
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUM is $STATE — skip."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "PR #$PR_NUM is draft — skip."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$BASE" != "main" ]; then
+            echo "PR #$PR_NUM base is $BASE — skip (main only)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$HEAD_OWNER" != "${{ github.repository_owner }}" ]; then
+            echo "PR #$PR_NUM is from a fork — skip (security)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Label gate.
+          LABELS=$(echo "$PR_DATA" | jq -r '.labels[].name')
+          if echo "$LABELS" | grep -qxE 'auto-merge|ready-to-merge'; then
+            echo "PR #$PR_NUM has merge label — proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR #$PR_NUM has no auto-merge / ready-to-merge label — skip."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve merge conflicts via rebase (or route to rework)
+        id: conflict
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ steps.pr.outputs.pr }}
+        run: |
+          set -euo pipefail
+
+          # GitHub computes mergeability asynchronously — right after a sibling
+          # PR merges, a conflicting PR can still report UNKNOWN. Poll briefly.
+          MERGEABLE="UNKNOWN"; STATUS=""; HEAD_REF=""
+          for i in $(seq 1 6); do
+            DATA=$(gh pr view "$PR_NUM" --repo "$REPO" --json mergeable,mergeStateStatus,headRefName)
+            MERGEABLE=$(echo "$DATA" | jq -r .mergeable)
+            STATUS=$(echo "$DATA" | jq -r .mergeStateStatus)
+            HEAD_REF=$(echo "$DATA" | jq -r .headRefName)
+            [ "$MERGEABLE" != "UNKNOWN" ] && break
+            echo "[poll $i/6] PR #$PR_NUM mergeable still UNKNOWN; waiting..."
+            sleep 10
+          done
+          echo "PR #$PR_NUM mergeable=$MERGEABLE mergeState=$STATUS headRef=$HEAD_REF"
+
+          # Clean (MERGEABLE / CLEAN / UNSTABLE / BEHIND) → let the normal merge path handle it.
+          if [ "$MERGEABLE" != "CONFLICTING" ] && [ "$STATUS" != "DIRTY" ]; then
+            echo "No conflict — proceeding to normal merge."
+            echo "stop=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::PR #$PR_NUM is CONFLICTING — attempting automatic rebase onto main."
+          WORK=$(mktemp -d)
+          git clone --quiet --no-tags "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$WORK"
+          cd "$WORK"
+          git config user.email "actions@github.com"
+          git config user.name "gh-aw auto-merge"
+          git fetch --quiet --no-tags origin "$HEAD_REF"
+          git checkout -B "$HEAD_REF" "origin/$HEAD_REF"
+
+          if git rebase origin/main; then
+            git push --force-with-lease origin "HEAD:$HEAD_REF"
+            gh pr comment "$PR_NUM" --repo "$REPO" --body "Auto-rebased onto \`main\` to clear a merge conflict. Re-running checks; auto-merge will retry once they pass."
+            echo "Rebase clean and pushed. Auto-merge will re-fire after checks finish."
+            echo "stop=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::Rebase hit real conflicts — routing PR #$PR_NUM to rework."
+          git rebase --abort || true
+          gh pr edit "$PR_NUM" --repo "$REPO" --remove-label ready-to-merge --add-label needs-rework
+          gh pr comment "$PR_NUM" --repo "$REPO" --body "Merge conflict that auto-rebase could not resolve. Removed \`ready-to-merge\` and applied \`needs-rework\` so the rework loop regenerates this PR on a fresh base."
+          echo "stop=true" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Wait for Backend Tests, then squash-merge (rate-limit aware)
+        if: steps.pr.outputs.skip != 'true' && steps.conflict.outputs.stop != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUM: ${{ steps.pr.outputs.pr }}
+        run: |
+          set -uo pipefail
+
+          # The whole agentic factory shares ONE PAT's 5000/hr REST budget, so a
+          # transient rate-limit 403 is common. gh_try retries on a rate-limit /
+          # secondary-limit error (waiting for the core reset, bounded) instead of
+          # letting a single 403 abort an otherwise-ready merge. A genuine
+          # exhaustion just leaves the PR `ready-to-merge` — PR Auto-Merge re-fires
+          # on the next event and aw-pipeline-watchdog re-fires it hourly.
+          gh_try() {
+            local out rc attempt=0
+            while :; do
+              out=$("$@" 2>&1); rc=$?
+              if [ "$rc" -eq 0 ]; then printf '%s' "$out"; return 0; fi
+              if printf '%s' "$out" | grep -qiE 'rate limit|secondary rate|abuse detection'; then
+                attempt=$((attempt + 1))
+                if [ "$attempt" -gt 6 ]; then echo "::warning::still rate-limited after $attempt tries" >&2; return 1; fi
+                local reset now wait
+                reset=$(gh api rate_limit --jq '.resources.core.reset' 2>/dev/null || echo "")
+                now=$(date -u +%s)
+                if [ -n "$reset" ] && [ "$reset" -gt "$now" ]; then wait=$(( reset - now + 3 )); else wait=30; fi
+                [ "$wait" -gt 90 ] && wait=90
+                echo "::warning::rate-limited; sleeping ${wait}s then retry (attempt $attempt/6)" >&2
+                sleep "$wait"; continue
+              fi
+              printf '%s' "$out"; return "$rc"   # non-rate-limit error: surface it
+            done
+          }
+
+          # 1) Wait for Test Backend to be green — ONE API call per poll.
+          green=""
+          for i in $(seq 1 20); do
+            CHECK=$(gh_try gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              --jq '.check_runs[] | select(.name=="Test Backend" or .name=="Backend Tests") | "\(.status)/\(.conclusion // "pending")"' | head -1)
+            echo "[poll $i/20] PR #$PR_NUM Test Backend: ${CHECK:-not-reported}"
+            case "$CHECK" in
+              completed/success|completed/skipped|completed/neutral) green=1; break ;;
+              completed/failure|completed/cancelled|completed/timed_out|completed/action_required)
+                echo "::error::Backend Tests concluded $CHECK — refusing to merge PR #$PR_NUM."; exit 1 ;;
+            esac
+            sleep 30
+          done
+          if [ -z "$green" ]; then
+            echo "::warning::Backend Tests not green within budget — leaving PR #$PR_NUM ready-to-merge; auto-merge/watchdog will retry."
+            exit 0   # not a pipeline failure: a later event / hourly watchdog re-fires this
+          fi
+
+          # 2) Squash-merge (idempotent; rate-limit aware).
+          echo "Squash-merging PR #$PR_NUM"
+          if gh_try gh pr merge "$PR_NUM" --repo "$REPO" --squash --delete-branch; then
+            echo "Merged."; exit 0
+          fi
+          STATE=$(gh_try gh pr view "$PR_NUM" --repo "$REPO" --json state -q .state || echo "")
+          if [ "$STATE" = "MERGED" ]; then echo "Already merged by a concurrent run."; exit 0; fi
+          echo "::warning::Merge did not complete (state=${STATE:-unknown}) — likely rate-limited. Leaving PR ready-to-merge for retry."
+          exit 0   # don't hard-fail on rate-limit; retry-later via re-fire

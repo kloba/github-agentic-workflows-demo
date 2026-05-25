@@ -1,0 +1,302 @@
+name: Pipeline Watchdog
+
+# Hourly reconciler for the autonomous factory.
+#
+# The event-driven workflows (Issue Fixer, PR Reviewer, PR Auto-Merge,
+# PR Requeue, PR Rework) cover the happy path. But work still falls through
+# the cracks when a workflow RUN errors transiently, or an issue/PR never gets
+# picked up at all. Nothing in the factory re-checks "is everything actually
+# moving?" on a wall-clock cadence. This watchdog does, every hour, and
+# unblocks each stuck state with the cheapest safe action:
+#
+#   1. Rerun transiently-failed factory runs (`gh run rerun --failed`), capped
+#      by attempt count so a genuinely-broken workflow is not retried forever.
+#   2. Re-fire orphaned issues (trigger label, no PR, aged) via a label cycle
+#      — same mechanism aw-pr-rework.yml uses to re-enter Issue Fixer.
+#   3. Re-fire stale `ready-to-merge` PRs (Test Backend green, not merged) via
+#      a label cycle so PR Auto-Merge picks them up again.
+#   4. When a workflow exhausts its rerun cap / fails a streak (the pipeline
+#      machinery itself is broken), open a `pipeline-repair` issue —
+#      aw-pipeline-repair.md (an agent allowed to edit .github/workflows)
+#      diagnoses the run logs and fixes the YAML via a gated PR.
+#   5. Escalate to `needs-human` anything that exhausts the watchdog re-fire cap.
+#
+# All mutations use GH_AW_GITHUB_TOKEN, mirroring the other factory workflows.
+# Every action is bounded and idempotent: re-running the watchdog on an already
+# healthy / already escalated item is a no-op.
+
+on:
+  schedule:
+    - cron: "37 * * * *"   # hourly, offset off :00/:15 to avoid contending with PR Requeue
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: write          # gh run rerun
+
+concurrency:
+  group: pipeline-watchdog
+  cancel-in-progress: false
+
+env:
+  # Issue labels that mean "Issue Fixer should act" (mirror aw-issue-fixer.md).
+  TRIGGER_LABELS: "bug security ci-failure feature-request chore"
+  # Factory workflow display names the watchdog reruns / health-checks.
+  FACTORY_WORKFLOWS: "Issue Fixer|PR Reviewer|PR Auto-Merge|PR Rework on Reviewer Reject|PR Rework on Test Failure|PR Requeue (rebase stale approved PRs)|Issue Triager|AI Tester|CI Doctor|Security Scanner"
+  ISSUE_STUCK_HOURS: "2"        # an aged trigger-labelled issue with no PR is "orphaned"
+  PR_MERGE_STUCK_HOURS: "1"     # a ready-to-merge PR not merged after this is "stalled"
+  RUN_LOOKBACK_HOURS: "3"       # only rerun failures inside this window
+  MAX_RERUN_ATTEMPTS: "3"       # stop rerunning a run past this attempt count
+  MAX_WATCHDOG_REFIRE: "3"      # re-fires per issue/PR before escalating to a human
+  WF_FAIL_STREAK: "3"           # consecutive completed-failures => pipeline broken
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Rerun transiently-failed factory runs
+        run: |
+          set -uo pipefail
+          set +e   # best-effort reconciler: a single failed gh call logs & is skipped, never aborts the pass (GitHub's default shell is `bash -e`; the hourly schedule retries idempotently)
+          SINCE=$(date -u -d "${RUN_LOOKBACK_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Scanning factory runs that failed since $SINCE"
+
+          FAILED=$(gh run list --repo "$REPO" --limit 100 \
+            --json databaseId,name,conclusion,status,createdAt \
+            --jq "[.[] | select(.status==\"completed\" and .conclusion==\"failure\" and (.createdAt > \"$SINCE\"))]")
+          COUNT=$(echo "$FAILED" | jq 'length')
+          echo "Recently-failed completed runs: $COUNT"
+
+          echo "$FAILED" | jq -c '.[]' | while read -r run; do
+            ID=$(echo "$run" | jq -r .databaseId)
+            NAME=$(echo "$run" | jq -r .name)
+            echo "$NAME" | grep -qE "^(${FACTORY_WORKFLOWS})$" || { echo "· skip non-factory run: $NAME"; continue; }
+
+            ATTEMPT=$(gh run view "$ID" --repo "$REPO" --json attempt --jq .attempt 2>/dev/null || echo 1)
+            if [ "$ATTEMPT" -ge "$MAX_RERUN_ATTEMPTS" ]; then
+              echo "::warning::$NAME run $ID at attempt $ATTEMPT (>= $MAX_RERUN_ATTEMPTS cap) — leaving for pipeline-repair (step 4)."
+              continue
+            fi
+            echo "↻ Rerunning failed jobs of '$NAME' run $ID (attempt $ATTEMPT)."
+            gh run rerun "$ID" --repo "$REPO" --failed 2>&1 || echo "  (rerun refused — run likely too old / already rerun)"
+          done
+
+      - name: Re-fire orphaned issues
+        run: |
+          set -uo pipefail
+          set +e   # best-effort reconciler: a single failed gh call logs & is skipped, never aborts the pass (GitHub's default shell is `bash -e`; the hourly schedule retries idempotently)
+          NOW=$(date -u +%s)
+
+          gh issue list --repo "$REPO" --state open --limit 100 \
+            --json number,labels,updatedAt > /tmp/issues.json
+          jq -c '.[]' /tmp/issues.json | while read -r iss; do
+            NUM=$(echo "$iss" | jq -r .number)
+            LABELS=$(echo "$iss" | jq -r '.labels[].name')
+
+            # Must carry a trigger label.
+            TRIG=""
+            for L in $TRIGGER_LABELS; do echo "$LABELS" | grep -qx "$L" && TRIG="$L" && break; done
+            [ -z "$TRIG" ] && continue
+
+            # Only re-fire PRISTINE, never-processed issues. The presence of ANY of
+            # these markers means Issue Fixer already ran (made a PR, routed to
+            # pipeline-repair, marked a benign false alarm, or a retry is counted) —
+            # re-firing then would loop forever and burn an agent run each pass. This
+            # is the key loop guard: re-fire at most once; once Issue Fixer runs it
+            # stamps `auto-fix-attempted`, so the next pass skips the issue.
+            echo "$LABELS" | grep -qxE 'auto-fix-attempted|auto-fix-retry-[0-9]+|do-not-fix|wontfix|wip|tester-rejected|needs-human|pipeline-repair' && continue
+
+            # Age gate (use updatedAt so active issues are left alone).
+            UPDATED=$(echo "$iss" | jq -r .updatedAt)
+            AGE_H=$(( (NOW - $(date -u -d "$UPDATED" +%s)) / 3600 ))
+            [ "$AGE_H" -lt "$ISSUE_STUCK_HOURS" ] && continue
+
+            # An open PR already addresses it → not stuck.
+            OPEN_PRS=$(gh pr list --repo "$REPO" --state open --search "in:body #$NUM" --json number --jq 'length')
+            [ "$OPEN_PRS" -gt 0 ] && { echo "· #$NUM has an open PR — skip"; continue; }
+
+            echo "::warning::Issue #$NUM ($TRIG) never processed (idle ${AGE_H}h, no PR, no auto-fix marker). Re-firing Issue Fixer once."
+            # Cycle the trigger label to emit a fresh issues.labeled event. No dedup
+            # label to clear (none present — that's the pristine guard above).
+            gh issue edit "$NUM" --repo "$REPO" --remove-label "$TRIG" 2>/dev/null || true
+            sleep 3
+            gh issue edit "$NUM" --repo "$REPO" --add-label "$TRIG" 2>/dev/null || true
+            gh issue comment "$NUM" --repo "$REPO" --body "🔁 **Pipeline Watchdog**: this issue carried \`$TRIG\` for ${AGE_H}h with no Issue Fixer run and no PR. Re-firing Issue Fixer once."
+          done
+
+      - name: Re-fire stalled ready-to-merge PRs
+        run: |
+          set -uo pipefail
+          set +e   # best-effort reconciler: a single failed gh call logs & is skipped, never aborts the pass (GitHub's default shell is `bash -e`; the hourly schedule retries idempotently)
+          NOW=$(date -u +%s)
+
+          gh pr list --repo "$REPO" --state open --limit 100 \
+            --json number,labels,isDraft,baseRefName,headRepositoryOwner,updatedAt > /tmp/prs.json
+          jq -c '.[]' /tmp/prs.json | while read -r pr; do
+            NUM=$(echo "$pr" | jq -r .number)
+            [ "$(echo "$pr" | jq -r .isDraft)" = "true" ] && continue
+            [ "$(echo "$pr" | jq -r .baseRefName)" != "main" ] && continue
+            [ "$(echo "$pr" | jq -r '.headRepositoryOwner.login')" != "$OWNER" ] && continue
+
+            LABELS=$(echo "$pr" | jq -r '.labels[].name')
+            echo "$LABELS" | grep -qx ready-to-merge || continue
+
+            UPDATED=$(echo "$pr" | jq -r .updatedAt)
+            AGE_H=$(( (NOW - $(date -u -d "$UPDATED" +%s)) / 3600 ))
+            [ "$AGE_H" -lt "$PR_MERGE_STUCK_HOURS" ] && continue
+
+            # Only re-fire if Test Backend is green (or legitimately absent) — never push a red PR.
+            HEAD=$(gh pr view "$NUM" --repo "$REPO" --json headRefOid --jq .headRefOid)
+            TB=$(gh api "repos/$REPO/commits/$HEAD/check-runs" \
+              --jq '.check_runs[] | select(.name=="Test Backend") | "\(.status)/\(.conclusion // "pending")"' | head -1)
+            case "$TB" in
+              completed/success|completed/skipped|completed/neutral|"") : ;;
+              *) echo "· #$NUM Test Backend=$TB — not green, skip"; continue ;;
+            esac
+
+            # Re-fire cap (mirrors the issue path).
+            RC=$(echo "$LABELS" | grep -oE '^watchdog-refire-[0-9]+$' | grep -oE '[0-9]+$' | sort -rn | head -1 || true)
+            RC=${RC:-0}
+            if [ "$RC" -ge "$MAX_WATCHDOG_REFIRE" ]; then
+              if ! echo "$LABELS" | grep -qx needs-human; then
+                gh pr edit "$NUM" --repo "$REPO" --add-label needs-human 2>/dev/null || true
+                gh pr comment "$NUM" --repo "$REPO" --body "🛑 **Pipeline Watchdog**: \`ready-to-merge\` with Test Backend green, but auto-merge has not completed across $RC nudges. The PR Auto-Merge job is likely broken — escalating to \`needs-human\` (see any open \`pipeline-repair\` issue)."
+              fi
+              continue
+            fi
+
+            NEXT=$((RC + 1))
+            echo "::warning::PR #$NUM ready-to-merge ${AGE_H}h, Test Backend=$TB, not merged. Re-firing auto-merge → watchdog-refire-$NEXT."
+            gh label create "watchdog-refire-$NEXT" --color ededed --description "Pipeline Watchdog re-fire attempt $NEXT" --force >/dev/null 2>&1 || true
+            gh pr edit "$NUM" --repo "$REPO" --add-label "watchdog-refire-$NEXT" 2>/dev/null || true
+            # Cycle the merge label to emit a fresh `pull_request.labeled` event for PR Auto-Merge.
+            gh pr edit "$NUM" --repo "$REPO" --remove-label ready-to-merge 2>/dev/null || true
+            sleep 3
+            gh pr edit "$NUM" --repo "$REPO" --add-label ready-to-merge 2>/dev/null || true
+          done
+
+      - name: Rework PRs stuck in needs-rework
+        run: |
+          set -uo pipefail
+          set +e   # best-effort reconciler: a single failed gh call logs & is skipped, never aborts the pass (GitHub's default shell is `bash -e`; the hourly schedule retries idempotently)
+          NOW=$(date -u +%s)
+          MAX_RETRIES=3
+
+          gh pr list --repo "$REPO" --state open --limit 100 \
+            --json number,labels,baseRefName,headRepositoryOwner,updatedAt,body > /tmp/rework.json
+          jq -c '.[]' /tmp/rework.json | while read -r pr; do
+            NUM=$(echo "$pr" | jq -r .number)
+            [ "$(echo "$pr" | jq -r .baseRefName)" != "main" ] && continue
+            [ "$(echo "$pr" | jq -r '.headRepositoryOwner.login')" != "$OWNER" ] && continue
+
+            LABELS=$(echo "$pr" | jq -r '.labels[].name')
+            echo "$LABELS" | grep -qx needs-rework || continue
+
+            UPDATED=$(echo "$pr" | jq -r .updatedAt)
+            AGE_M=$(( (NOW - $(date -u -d "$UPDATED" +%s)) / 60 ))
+            [ "$AGE_M" -lt 5 ] && { echo "· #$NUM needs-rework ${AGE_M}m — let aw-pr-rework try first"; continue; }
+
+            # aw-pr-rework.yml SHOULD close this PR + re-fire the issue, but it triggers
+            # on a `labeled` event on the PR — and that webhook does NOT reliably create
+            # a workflow run for a CONFLICTING/stale PR (observed on #341). So the
+            # watchdog, fired by its own schedule, performs the rework DIRECTLY. The
+            # Issue Fixer re-fire acts on the ISSUE, whose events are unaffected.
+            BODY=$(echo "$pr" | jq -r .body)
+            ISSUE=$(echo "$BODY" | grep -ioE '(closes|fixes|resolves) #[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+            if [ -z "$ISSUE" ]; then
+              echo "::warning::#$NUM needs-rework but no linked issue — closing PR only."
+              gh pr close "$NUM" --repo "$REPO" --comment "Closed by Pipeline Watchdog: \`needs-rework\` with no linked issue in the body; manual follow-up needed."
+              continue
+            fi
+
+            # Shared retry counter (same auto-fix-retry-N labels aw-pr-rework uses).
+            ILABELS=$(gh issue view "$ISSUE" --repo "$REPO" --json labels --jq '.labels[].name')
+            RETRY=$(echo "$ILABELS" | grep -oE '^auto-fix-retry-[0-9]+$' | grep -oE '[0-9]+$' | sort -rn | head -1 || true)
+            RETRY=${RETRY:-0}
+            NEXT=$((RETRY + 1))
+            TRIG=""
+            for L in $TRIGGER_LABELS; do echo "$ILABELS" | grep -qx "$L" && TRIG="$L" && break; done
+
+            if [ "$NEXT" -gt "$MAX_RETRIES" ]; then
+              echo "::warning::#$ISSUE hit retry cap ($MAX_RETRIES) — applying do-not-fix."
+              gh issue edit "$ISSUE" --repo "$REPO" --add-label do-not-fix
+              gh issue comment "$ISSUE" --repo "$REPO" --body "🛑 **Pipeline Watchdog**: auto-fix retry cap ($MAX_RETRIES) reached; latest rejected PR #$NUM. Applying \`do-not-fix\` — human attention needed."
+              gh pr close "$NUM" --repo "$REPO" --comment "Closed by Pipeline Watchdog: retry cap reached on issue #$ISSUE."
+              continue
+            fi
+
+            echo "::warning::Reworking #$NUM directly → close, reopen #$ISSUE, re-fire Issue Fixer (retry $NEXT/$MAX_RETRIES)."
+            gh pr close "$NUM" --repo "$REPO" --comment "↩️ Closed by **Pipeline Watchdog**. \`aw-pr-rework\` did not fire for this stale/conflicting PR (its labeled-event trigger doesn't run for conflicting PRs). Reopening #$ISSUE for a fresh attempt on current \`main\` (retry $NEXT/$MAX_RETRIES)."
+            gh issue edit "$ISSUE" --repo "$REPO" --add-label "auto-fix-retry-$NEXT"
+            gh issue edit "$ISSUE" --repo "$REPO" --remove-label auto-fix-attempted
+            gh issue reopen "$ISSUE" --repo "$REPO"
+            if [ -n "$TRIG" ]; then
+              # Cycle the trigger label on the ISSUE to emit a fresh issues.labeled event.
+              gh issue edit "$ISSUE" --repo "$REPO" --remove-label "$TRIG"
+              sleep 3
+              gh issue edit "$ISSUE" --repo "$REPO" --add-label "$TRIG"
+              gh issue comment "$ISSUE" --repo "$REPO" --body "🔁 **Pipeline Watchdog**: re-firing Issue Fixer after closing stale PR #$NUM (retry $NEXT/$MAX_RETRIES)."
+            else
+              echo "::warning::#$ISSUE has no trigger label — cannot re-fire Issue Fixer automatically."
+            fi
+          done
+
+      - name: Flag broken pipeline workflows for repair
+        run: |
+          set -uo pipefail
+          set +e   # best-effort reconciler: a single failed gh call logs & is skipped, never aborts the pass (GitHub's default shell is `bash -e`; the hourly schedule retries idempotently)
+          gh run list --repo "$REPO" --limit 150 \
+            --json databaseId,name,conclusion,status,createdAt > /tmp/runs.json
+
+          echo "$FACTORY_WORKFLOWS" | tr '|' '\n' | while read -r WF; do
+            [ -z "$WF" ] && continue
+            RECENT=$(jq -c --arg wf "$WF" --argjson n "$WF_FAIL_STREAK" \
+              '[ .[] | select(.name==$wf and .status=="completed") ] | .[0:$n]' /tmp/runs.json)
+            CNT=$(echo "$RECENT" | jq 'length')
+            [ "$CNT" -lt "$WF_FAIL_STREAK" ] && continue
+            FAILS=$(echo "$RECENT" | jq '[ .[] | select(.conclusion=="failure") ] | length')
+            [ "$FAILS" -lt "$WF_FAIL_STREAK" ] && continue
+
+            LATEST_ID=$(echo "$RECENT" | jq -r '.[0].databaseId')
+            RUN_URL="https://github.com/$REPO/actions/runs/$LATEST_ID"
+            TITLE="[watchdog] Pipeline broken: $WF failing $WF_FAIL_STREAK runs straight"
+
+            # Dedup by deterministic title. The `pipeline-repair` label is auto-removed
+            # by aw-pipeline-repair.md's label_command trigger, so it cannot be used as a
+            # persistent dedup marker — the open issue itself is the marker.
+            EXIST=$(gh issue list --repo "$REPO" --state open --limit 100 --json title \
+              --jq "[ .[] | select(.title | startswith(\"$TITLE\")) ] | length")
+            if [ "$EXIST" -gt 0 ]; then echo "· '$WF' already flagged — skip"; continue; fi
+
+            echo "::error::'$WF' failed its last $WF_FAIL_STREAK runs — opening pipeline-repair issue."
+            gh label create pipeline-repair --color b60205 --description "Pipeline machinery broken — repair the workflow YAML (triggers aw-pipeline-repair)" --force >/dev/null 2>&1 || true
+            BODY_FILE="$(mktemp)"
+            {
+              echo "The factory workflow **$WF** has failed its last $WF_FAIL_STREAK completed runs. Reruns did not recover it, so the workflow definition itself is likely broken (bad YAML, a renamed check, a permissions/token gap, or a logic bug)."
+              echo
+              echo "- Latest failed run: $RUN_URL"
+              echo "- Workflow: \`$WF\`"
+              echo
+              echo "\`aw-pipeline-repair.md\` is triggered by the \`pipeline-repair\` label on this issue. It reads the failing run logs, finds the root cause in the workflow file under \`.github/workflows/\`, and opens a gated PR (\`awaiting-review\`) with the fix. A human is also pinged via \`needs-human\` because broken pipeline machinery can stall the whole factory."
+            } > "$BODY_FILE"
+            NEW_URL=$(gh issue create --repo "$REPO" \
+              --title "$TITLE" \
+              --label needs-human \
+              --body-file "$BODY_FILE")
+            NEW_NUM=$(echo "$NEW_URL" | grep -oE '[0-9]+$' || true)
+            echo "Opened pipeline-repair issue #$NEW_NUM for '$WF'."
+            # Apply the trigger label via edit (a separate `labeled` event) so the
+            # label_command trigger in aw-pipeline-repair.md reliably fires.
+            gh issue edit "$NEW_NUM" --repo "$REPO" --add-label pipeline-repair 2>/dev/null || true
+          done
+
+      - name: Summary
+        if: always()
+        run: echo "Pipeline Watchdog pass complete at $(date -u +%FT%TZ)."
